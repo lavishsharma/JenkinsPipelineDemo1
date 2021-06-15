@@ -10,7 +10,7 @@ def EmailRecipients
 
 try
 {
-	node('consulting') {
+	node('master') {
 		//CHANGE_TARGET: For a multibranch project corresponding to some kind of change request, this will be set to the target or base branch to which the change could be merged.
 		def branchName = env.CHANGE_TARGET ?: env.BRANCH_NAME
 
