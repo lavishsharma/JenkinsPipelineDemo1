@@ -1,0 +1,130 @@
+properties([
+	pipelineTriggers([]),
+	disableConcurrentBuilds(),
+])
+
+def emailExtRecipientProviders
+def EmailSuccess
+def EmailFailure
+def EmailRecipients
+
+try
+{
+	node('consulting') {
+		//CHANGE_TARGET: For a multibranch project corresponding to some kind of change request, this will be set to the target or base branch to which the change could be merged.
+		def branchName = env.CHANGE_TARGET ?: env.BRANCH_NAME
+
+		stage('Checkout') {
+			def repositoryName = scm.getUserRemoteConfigs()[0].getUrl().tokenize('/').last()
+			def referenceRepository = (env.sandboxRootDir == null) ? [] : [[$class: 'CloneOption', reference: "${env.sandboxRootDir}\\${repositoryName}"]]
+
+			checkout([
+				$class: 'GitSCM',
+				branches: scm.branches,
+				extensions: scm.extensions + referenceRepository,
+				userRemoteConfigs: scm.userRemoteConfigs
+			])
+		}
+
+		def jenkinsfileProperties = readJSON file: "AutomatedProcedures/JenkinsfileProperties.json"
+		def jenkinsfileUtilities = load "AutomatedProcedures/JenkinsScripts/JenkinsfileUtilities.groovy"
+
+		def credentialBindings = []
+		jenkinsfileProperties.credentials.each { credential ->
+			jenkinsfileUtilities.putCredentialToBindingsIfValid(credential, credentialBindings)
+		}
+		def existingFeatureLicensesIDs = []
+		// attach feature licence credential IDs specified in the Feature.License.Credential.IDs parameter
+		def featureLicenseCredentialIDs = env["Feature.License.Credential.IDs"]?.tokenize('\n;, ') ?: jenkinsfileProperties.featureLicenseCredentialIDs
+		featureLicenseCredentialIDs.each { credentialId ->
+			def featureLicenseCredential = [$class: "StringBinding", credentialsId: credentialId, variable: credentialId]
+			if (jenkinsfileUtilities.putCredentialToBindingsIfValid(featureLicenseCredential, credentialBindings)) {
+				existingFeatureLicensesIDs.add(credentialId)
+			}
+		}
+		withCredentials(credentialBindings) {
+			jenkinsfileUtilities.addNantParameterFromEnvironment('Innovator.License.Type', 'Unlimited')
+			jenkinsfileUtilities.addNantParameterFromEnvironment('Innovator.Activation.Key')
+			jenkinsfileUtilities.addNantParameterFromEnvironment('Innovator.License.Key')
+			jenkinsfileUtilities.addNantParameterFromEnvironment('MSSQL.Server')
+			jenkinsfileUtilities.addNantParameterFromEnvironment('Path.To.CodeTree.Zip')
+			jenkinsfileUtilities.addNantParameterFromEnvironment('Path.To.DB.Bak')
+			jenkinsfileUtilities.addNantParameterFromEnvironment('Url.Of.Deployment.Server')
+			jenkinsfileUtilities.addNantParameterFromEnvironment('MachineSpecific.Includes.Folder.Path')
+			jenkinsfileUtilities.addNantParameter('Branch.Name', branchName)
+			// In order to have unique timestamp for build and not for every NAnt launch.
+			def dateFormatter = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH-mm-ss")
+			jenkinsfileUtilities.addNantParameter('This.Script.Start.Time.As.Sortable.Date', dateFormatter.format(new Date()))
+			jenkinsfileUtilities.addNantParameterFromEnvironment('MSSQL.Innovator.Password', 'innovator')
+			jenkinsfileUtilities.addNantParameterFromEnvironment('MSSQL.Innovator.Regular.Password', 'innovator')
+			jenkinsfileUtilities.addNantParameterFromEnvironment('MSSQL.SA.Password')
+			jenkinsfileUtilities.addNantParameterFromEnvironment('Innovator.License.String')
+			jenkinsfileUtilities.addNantParameterFromEnvironment('Perform.Import.Of.SampleData')
+			def buildIdentifier = "${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
+			jenkinsfileUtilities.addNantParameter('Build.Identifier', buildIdentifier)
+
+			jenkinsfileUtilities.addNantParameter('Feature.License.Credential.IDs', existingFeatureLicensesIDs.join(','));
+
+			try {
+				emailExtRecipientProviders = env["EmailExtRecipientProviders"] ?: ''
+				EmailSuccess = env["EmailSuccess"] ?: ''
+				EmailFailure = env["EmailFailure"] ?: ''
+				EmailRecipients = EmailSuccess
+
+				timestamps {
+					stage('ContinuousIntegration') {
+						jenkinsfileUtilities.runNantTargets(['ContinuousIntegration'])
+					}
+				}
+				currentBuild.result = 'SUCCESS'
+			}
+			catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+				currentBuild.result = 'ABORTED'
+
+				throw e
+			}
+			finally {
+				stage('Upload logs') {
+					step([$class: 'NUnitPublisher', testResultsPattern: '/AutomatedProceduresOutput/TestsOutput/nunit*.results.xml', debug: false, keepJUnitReports: true, skipJUnitArchiver:false, failIfNoResults: false])
+					junit allowEmptyResults: true, testResults: '/AutomatedProceduresOutput/TestsOutput/ClientTests/TestResults/**/*.xml'
+					publishHTML (target: [
+						allowMissing: false,
+						alwaysLinkToLastBuild: false,
+						keepAll: true,
+						reportDir: 'AutomatedProceduresOutput/TestsOutput/UnitTestsCoverageSummary',
+						reportFiles: 'summary.htm',
+						reportName: "OpenCover Report"
+					])
+
+					archiveArtifacts artifacts: '*-Package-From-*.zip', allowEmptyArchive: true
+				}
+
+				stage('Cleanup Jenkins Workspace') {
+					if (currentBuild.result == 'ABORTED') {
+						jenkinsfileUtilities.runNantTargets(['Clean.Up'])
+					}
+
+					deleteDir()
+				}
+			}
+		}
+	}
+}
+finally {
+	stage('Send emails') {
+		if (currentBuild.result != 'SUCCESS') {
+			def recipientProviders = []
+			if (emailExtRecipientProviders != null && emailExtRecipientProviders != '') {
+				def providerNames = emailExtRecipientProviders.split()
+				for (i = 0; i < providerNames.size(); i++) {
+						recipientProviders.add([$class: providerNames[i]])
+				}
+			}
+			def providedRecipients = recipientProviders.isEmpty() ? '' : emailextrecipients(recipientProviders)
+			EmailRecipients = "${EmailFailure} ${providedRecipients}".trim()
+		}
+		if (EmailRecipients != '') {
+			emailext body: '$DEFAULT_CONTENT',subject: '[JENKINS] ' + '$DEFAULT_SUBJECT', to: EmailRecipients
+		}
+	}
+}
